@@ -1,0 +1,190 @@
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from sqlalchemy.orm import Session
+from .models import InventoryItem
+from datetime import datetime
+import os
+
+SCOPES = [
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive"
+]
+
+DOC_TEMPLATE_ID = os.getenv("GOOGLE_DOC_TEMPLATE_ID")
+SERVICE_ACCOUNT_FILE = os.getenv("CREDENTIALS_GOOGLE")
+
+def generate_report(db):
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE,
+            scopes=SCOPES
+        )
+
+        drive_service = build('drive', 'v3', credentials=creds)
+        docs_service = build('docs', 'v1', credentials=creds)
+
+        # 3. Copy template document
+        print(f"Copying template document: {DOC_TEMPLATE_ID}")
+        copied_file = drive_service.files().copy(
+            fileId=DOC_TEMPLATE_ID,
+            body={'name': f'Replenishment Report - {datetime.now().strftime("%Y-%m-%d %H:%M")}'} 
+        ).execute()
+        doc_id = copied_file.get("id")
+        print(f"Created new document: {doc_id}")
+
+        # 4. Make the document publicly viewable
+        permission = {
+            'type': 'anyone',
+            'role': 'writer'  # or 'reader' if you want read-only
+        }
+        drive_service.permissions().create(
+            fileId=doc_id,
+            body=permission
+        ).execute()
+        print("Document made publicly accessible")
+
+        # 5. Fetch inventory data
+        items = db.query(InventoryItem).all()
+        print(f"Found {len(items)} inventory items")
+
+        # 6. Build properly formatted content
+        report_content = "INVENTORY REPLENISHMENT REPORT\n"
+        report_content += "=" * 50 + "\n\n"
+        
+        if items:
+            # Create aligned table with fixed-width friendly spacing
+            report_content += f"{'PRODUCT NAME':<30} {'QTY':<8} {'THRESHOLD':<10} {'STATUS':<15}\n"
+            report_content += "-" * 65 + "\n"
+            
+            for item in items:
+                # Validate quantity and threshold
+                if (item.quantity is None or item.threshold is None or 
+                    item.quantity < 0 or item.threshold < 0):
+                    status = "❌ INVALID"
+                    quantity_str = str(item.quantity) if item.quantity is not None else "N/A"
+                    threshold_str = str(item.threshold) if item.threshold is not None else "N/A"
+                else:
+                    # Corrected status logic
+                    if item.quantity <= item.threshold:
+                        status = "⚠️ REORDER"
+                    elif item.quantity <= item.threshold * 1.5:
+                        status = "⚡ LOW STOCK"
+                    else:
+                        status = "✅ OK"
+                    quantity_str = str(item.quantity)
+                    threshold_str = str(item.threshold)
+                
+                product_name = item.product_name[:28] + ".." if len(item.product_name) > 30 else item.product_name
+                
+                # Ensure consistent spacing for alignment
+                report_content += f"{product_name:<30} {quantity_str:<8} {threshold_str:<10} {status:<15}\n"
+            
+            # Add summary section
+            total_items = len(items)
+            invalid_items = len([item for item in items if item.quantity is None or item.threshold is None or item.quantity < 0 or item.threshold < 0])
+            low_stock_items = len([item for item in items if item.quantity is not None and item.threshold is not None and item.quantity >= 0 and item.threshold >= 0 and item.quantity <= item.threshold])
+            critical_items = low_stock_items + invalid_items
+            critical_percentage = (critical_items / total_items * 100) if total_items > 0 else 0
+            
+            report_content += "\n" + "=" * 50 + "\n"
+            report_content += "SUMMARY\n"
+            report_content += "-" * 20 + "\n"
+            report_content += f"Total Items:           {total_items}\n"
+            report_content += f"Items Needing Reorder: {low_stock_items}\n"
+            if invalid_items > 0:
+                report_content += f"Invalid Items:         {invalid_items}\n"
+            report_content += f"Critical Items:        {critical_items}\n"
+            report_content += f"Critical Percentage:   {critical_percentage:.1f}%\n"
+            report_content += "Recommendation:        Prioritize reordering and data validation.\n"
+            
+            if critical_items > 0:
+                report_content += f"\n⚠️  ACTION REQUIRED: {critical_items} item(s) need immediate attention!\n"
+        else:
+            report_content += "No inventory items found in the database.\n"
+        
+        report_content += f"\n" + "=" * 50 + "\n"
+        report_content += f"Report Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n"
+        report_content += f"Generated by: Inventory Management System\n"
+
+        # 7. Insert content and apply formatting
+        requests = [
+            # Insert the main content
+            {
+                "insertText": {
+                    "text": report_content,
+                    "location": {"index": 1}
+                }
+            },
+            # Make the title bold and larger
+            {
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": 1,
+                        "endIndex": 1 + len("INVENTORY REPLENISHMENT REPORT")
+                    },
+                    "textStyle": {
+                        "bold": True,
+                        "fontSize": {"magnitude": 16, "unit": "PT"}
+                    },
+                    "fields": "bold,fontSize"
+                }
+            },
+            # Make the table headers bold
+            {
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": report_content.find("PRODUCT NAME"),
+                        "endIndex": report_content.find("PRODUCT NAME") + len("PRODUCT NAME    QTY     THRESHOLD  STATUS")
+                    },
+                    "textStyle": {
+                        "bold": True
+                    },
+                    "fields": "bold"
+                }
+            },
+            # Apply fixed-width font to table section
+            {
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": 1 + report_content.find("PRODUCT NAME"),
+                        "endIndex": 1 + report_content.find("SUMMARY") - 1
+                    },
+                    "textStyle": {
+                        "weightedFontFamily": {
+                            "fontFamily": "Courier New"
+                        },
+                        "fontSize": {"magnitude": 10, "unit": "PT"}
+                    },
+                    "fields": "weightedFontFamily,fontSize"
+                }
+            }
+        ]
+
+        # 8. Execute the single update request
+        if requests:
+            print(f"Executing document update with {len(report_content)} characters")
+            docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={"requests": requests}
+            ).execute()
+            print("Document updated successfully")
+        
+        doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+        print(f"Document URL: {doc_url}")
+        return doc_url
+
+    except HttpError as error:
+        print(f"An error occurred: {error}")
+        # Check if it's a permission error
+        if error.resp.status == 403:
+            print("Permission denied. Check if:")
+            print("1. Service account has access to the template document")
+            print("2. Template document ID is correct")
+            print("3. Service account credentials are valid")
+        elif error.resp.status == 404:
+            print("Template document not found. Check the DOC_TEMPLATE_ID")
+        raise error
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        raise e
